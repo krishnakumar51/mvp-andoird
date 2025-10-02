@@ -19,153 +19,109 @@ class LLMProvider(str, Enum):
 # --- PROMPT TEMPLATES ---
 
 REFINER_PROMPT = """
-Analyze the user's request and create a concise, actionable prompt for an AI agent.
-The agent will perform a web search on the user's behalf.
+Analyze the user's request and create a concise, actionable instruction for an AI web agent.
+Focus on the ultimate goal.
 
 User's Target URL: {url}
 User's Query: "{query}"
 
-Based on this, generate a single, clear instruction for the AI.
-Example: "Search for the latest smartphone models on example.com and extract the top 5 results."
-Refined Prompt:
+Based on this, generate a single, clear instruction.
+Example: "Find the top 5 smartphones under ₹50,000 on flipkart.com, collecting their name, price, and URL."
+Refined Instruction:
 """
 
-PLANNER_PROMPT = """
-You are a web automation planner. Your goal is to create a JSON array of actions to achieve the user's objective.
-Analyze the provided HTML, accessibility tree, and screenshot of the web page.
+AGENT_PROMPT = """
+You are an autonomous web agent with memory. Your goal is to achieve the user's objective by navigating and interacting with a web page.
+You operate in a step-by-step manner. At each step, analyze the current state of the page (HTML and screenshot), review your past actions, and decide on the single best next action.
 
-User's Objective: "{query}"
-Current URL: {url}
-HTML Content (first 20,000 chars):
+**User's Objective:** "{query}"
+**Current URL:** {url}
+**HTML Content (first 20,000 chars):**
 {html}
 
-Accessibility Tree (first 10,000 chars):
-{accessibility}
+**Recent Action History (Memory):**
+{history}
 
-Based on the visual evidence from the screenshot and the DOM structure, devise a plan.
-Valid action types are: "fill", "click", "press".
-- "fill": Use for input fields. Requires "selector" and "text".
-- "click": Use for buttons or links. Requires "selector".
-- "press": Use for submitting forms (e.g., with the "Enter" key). Requires "selector" and "key".
+**Your Task:**
+1.  **Think:** Analyze the situation. Review your history. If your last action failed, identify why and devise a new strategy. What is your immediate goal? What single action will bring you closer to the user's overall objective?
+2.  **Act:** Choose ONE action from the available tools.
 
-Return ONLY a valid JSON array of actions. Do not include any explanations or surrounding text.
+**Available Tools (Action JSON format):**
+-   `{{"type": "fill", "selector": "<css_selector>", "text": "<text_to_fill>"}}`: To type in an input field.
+-   `{{"type": "click", "selector": "<css_selector>"}}`: To click a button or link.
+-   `{{"type": "press", "selector": "<css_selector>", "key": "<key_name>"}}`: To press a key (e.g., "Enter") on an element. **Hint: After filling a search bar, this is often more reliable than clicking a suggestion button.**
+-   `{{"type": "scroll", "direction": "down"}}`: To scroll the page and reveal more content.
+-   `{{"type": "extract", "items": [{{"title": "...", "price": "...", "url": "...", "snippet": "..."}}]}}`: To extract structured data from the CURRENT VIEW.
+-   `{{"type": "finish", "reason": "<summary_of_completion>"}}`: To end the mission when the objective is fully met.
 
-Example:
-[
-    {{"type": "fill", "selector": "input[name='q']", "text": "latest smartphones"}},
-    {{"type": "press", "selector": "input[name='q']", "key": "Enter"}}
-]
-"""
+**Response Format:**
+You MUST respond with a single, valid JSON object containing "thought" and "action". Do NOT add any other text, explanations, or markdown.
 
-EXTRACTOR_PROMPT = """
-You are a data extraction specialist. Your task is to extract structured data from the given HTML content based on the user's query and a screenshot.
-The output must be a single JSON object with a key "items", which is a list of the extracted results.
-
-User's Objective: "{query}"
-Current URL: {url}
-HTML Content (first 40,000 chars):
-{html}
-
-Extract up to {top_k} items that match the user's objective. Include relevant fields like "title", "price", "url", and a "snippet".
-Ensure all URLs are complete.
-
-Return ONLY a valid JSON object. Do not include any explanations or surrounding text.
-
-Example:
+Example Response:
+```json
 {{
-    "items": [
-        {{
-            "title": "Example Phone Model",
-            "price": "₹45,000",
-            "url": "https://example.com/product/123",
-            "snippet": "A brief description of the phone..."
-        }}
-    ]
+    "thought": "My previous attempt to click the suggestion button failed with a timeout. A more robust approach is to press the 'Enter' key on the search bar I just filled.",
+    "action": {{"type": "press", "selector": "input[name='q']", "key": "Enter"}}
 }}
+```
+
+**Current Situation Analysis:**
+Based on the provided HTML, screenshot, and your recent history, what is your next thought and action?
 """
 
 def get_refined_prompt(url: str, query: str, provider: LLMProvider) -> str:
     """Generates a refined, actionable prompt from the user's raw query."""
     prompt = REFINER_PROMPT.format(url=url, query=query)
-    # The refiner is a simple text-to-text task, no vision needed.
-    response_text = get_llm_response(prompt, "You are a helpful assistant.", provider, images=[])
+    response_text = get_llm_response("You are a helpful assistant.", prompt, provider, images=[])
     return response_text.strip()
 
+def get_agent_action(query: str, url: str, html: str, provider: LLMProvider, screenshot_path: Path, history: str) -> dict:
+    """Gets the next thought and action from the agent, now with memory."""
+    prompt = AGENT_PROMPT.format(query=query, url=url, html=html[:20000], history=history or "No actions taken yet.")
+    system_prompt = "You are an autonomous web agent. Respond ONLY with the JSON object containing your thought and action."
+    
+    response_text = get_llm_response(system_prompt, prompt, provider, images=[screenshot_path])
+    
+    try:
+        return extract_json_from_response(response_text)
+    except ValueError:
+        return {"thought": "Error: Could not parse a valid JSON action from the model's response.", "action": {"type": "finish"}}
+
+
 def get_llm_response(
-    prompt: str,
     system_prompt: str,
+    prompt: str,
     provider: LLMProvider,
     images: List[Path]
 ) -> str:
-    """
-    Gets a response from the specified LLM provider, handling API differences.
-    This is the core function that abstracts away the different API call structures.
-    """
+    """Gets a response from the specified LLM provider, handling API differences."""
     if provider == LLMProvider.ANTHROPIC:
-        if not anthropic_client:
-            raise ValueError("Anthropic client is not initialized. Check API key.")
+        if not anthropic_client: raise ValueError("Anthropic client not initialized.")
         
-        # Correctly format the message for Anthropic's API (handles images)
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         for img_path in images:
-            with open(img_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            messages[0]["content"].append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": img_data,
-                },
-            })
+            with open(img_path, "rb") as f: img_data = base64.b64encode(f.read()).decode("utf-8")
+            messages[0]["content"].append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_data}})
         
-        response = anthropic_client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=messages
-        )
+        response = anthropic_client.messages.create(model=ANTHROPIC_MODEL, max_tokens=2048, system=system_prompt, messages=messages)
         return response.content[0].text
 
     elif provider == LLMProvider.OPENAI:
-        if not openai_client:
-            raise ValueError("OpenAI client is not initialized. Check API key.")
+        if not openai_client: raise ValueError("OpenAI client not initialized.")
         
-        # Correctly format the message for OpenAI's API (handles images)
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         for img_path in images:
-            with open(img_path, "rb") as f:
-                img_data = base64.b64encode(f.read()).decode("utf-8")
-            messages[0]["content"].append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img_data}"},
-            })
+            with open(img_path, "rb") as f: img_data = base64.b64encode(f.read()).decode("utf-8")
+            messages[0]["content"].append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}})
         
-        response = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            max_tokens=2048,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                *messages
-            ]
-        )
+        response = openai_client.chat.completions.create(model=OPENAI_MODEL, max_tokens=2048, messages=[{"role": "system", "content": system_prompt}, *messages])
         return response.choices[0].message.content
 
     elif provider == LLMProvider.GROQ:
-        if not groq_client:
-            raise ValueError("Groq client is not initialized. Check API key.")
-        if images:
-            # Groq model used here doesn't support images, so we raise an error.
-            raise ValueError("The configured Groq model does not support vision.")
+        if not groq_client: raise ValueError("Groq client not initialized.")
+        if images: raise ValueError("The configured Groq model does not support vision.")
 
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            max_tokens=2048,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ]
-        )
+        response = groq_client.chat.completions.create(model=GROQ_MODEL, max_tokens=2048, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}])
         return response.choices[0].message.content
 
     else:
@@ -173,37 +129,12 @@ def get_llm_response(
 
 
 def extract_json_from_response(text: str) -> Union[dict, list]:
-    """
-    Robustly extracts a JSON object or array from a string that might contain other text.
-    It looks for the first valid JSON block and parses it.
-    """
-    # Find the start of a JSON object '{' or array '['
-    json_start = -1
-    for i, char in enumerate(text):
-        if char in ['{', '[']:
-            json_start = i
-            break
-            
-    if json_start == -1:
-        raise ValueError("No JSON object or array found in the response.")
-
-    # Find the corresponding closing bracket
-    json_text = text[json_start:]
-    try:
-        return json.loads(json_text)
-    except json.JSONDecodeError:
-        # Fallback for truncated JSON - try to find matching brackets
-        open_brackets = 0
-        for i, char in enumerate(json_text):
-            if char in ['{', '[']:
-                open_brackets += 1
-            elif char in ['}', ']']:
-                open_brackets -= 1
-            if open_brackets == 0:
-                try:
-                    return json.loads(json_text[:i+1])
-                except json.JSONDecodeError:
-                    continue # Keep searching
-    
-    raise ValueError("Could not parse a valid JSON object or array from the response.")
+    """Robustly extracts a JSON object or array from a string."""
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            raise ValueError("Found a JSON-like structure but could not parse it.")
+    raise ValueError("No JSON object found in the response.")
 
