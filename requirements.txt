@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+beautifulsoup4
+pydantic
+httpx
+langdetect
+python-dotenv
+anthropic
+groq
+openai
+requests  # For OpenRouter session
+langchain-anthropic
+langchain-openai
+langchain-groq
+playwright-stealth
+langchain-community
+pillow
