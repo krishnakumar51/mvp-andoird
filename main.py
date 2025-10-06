@@ -3,6 +3,7 @@ import platform
 import uuid
 import json
 import time
+import csv
 from pathlib import Path
 from urllib.parse import urljoin
 import traceback
@@ -16,7 +17,7 @@ from PIL import Image
 from langgraph.graph import StateGraph, END
 
 from llm import LLMProvider, get_refined_prompt, get_agent_action
-from config import SCREENSHOTS_DIR
+from config import SCREENSHOTS_DIR, ANTHROPIC_MODEL, GROQ_MODEL, OPENAI_MODEL
 
 # --- FastAPI App Initialization ---
 app = FastAPI(title="LangGraph Web Agent with Memory")
@@ -24,6 +25,32 @@ app = FastAPI(title="LangGraph Web Agent with Memory")
 # --- In-Memory Job Storage ---
 JOB_QUEUES = {}
 JOB_RESULTS = {}
+
+# --- NEW: Token Cost Analysis Configuration ---
+ANALYSIS_DIR = Path("analysis")
+REPORT_CSV_FILE = Path("report.csv")
+
+
+# Prices per 1 Million tokens
+TOKEN_COSTS = {
+    "anthropic": {
+        "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
+        "claude-4-sonnet-20240229": {"input": 3.0, "output": 15.0},
+        "claude-3.5-sonnet-20240620": {"input": 3.0, "output": 15.0}
+    },
+    "openai": {
+        "gpt-4o": {"input": 5.0, "output": 15.0}
+    },
+    "groq": {
+        "llama3-8b-8192": {"input": 0.05, "output": 0.10}
+    }
+}
+
+MODEL_MAPPING = {
+    LLMProvider.ANTHROPIC: ANTHROPIC_MODEL,
+    LLMProvider.GROQ: GROQ_MODEL,
+    LLMProvider.OPENAI: OPENAI_MODEL
+}
 
 # --- Helper Functions ---
 def get_current_timestamp():
@@ -44,6 +71,68 @@ def resize_image_if_needed(image_path: Path, max_dimension: int = 2000):
                 img.save(image_path)
     except Exception as e:
         print(f"Warning: Could not resize image {image_path}. Error: {e}")
+
+# --- NEW: Cost Analysis Function ---
+def save_analysis_report(analysis_data: dict):
+    """Calculates final costs, saves a detailed JSON report, and appends to a summary CSV."""
+    job_id = analysis_data["job_id"]
+    provider = analysis_data["provider"]
+    model = analysis_data["model"]
+    
+    total_input = 0
+    total_output = 0
+    
+    for step in analysis_data["steps"]:
+        total_input += step.get("input_tokens", 0)
+        total_output += step.get("output_tokens", 0)
+
+    analysis_data["total_input_tokens"] = total_input
+    analysis_data["total_output_tokens"] = total_output
+
+    cost_info = TOKEN_COSTS.get(provider, {}).get(model)
+    # --- MODIFIED: Add a more robust fallback for different Anthropic model names ---
+    if not cost_info and provider == "anthropic":
+        model_name_lower = model.lower()
+        if "sonnet" in model_name_lower:
+            # Default to the latest Sonnet pricing if a specific version isn't matched
+            cost_info = TOKEN_COSTS.get("anthropic", {}).get("claude-3.5-sonnet-20240620")
+        elif "haiku" in model_name_lower:
+            cost_info = TOKEN_COSTS.get("anthropic", {}).get("claude-3-haiku-20240307")
+
+
+    total_cost = 0.0
+    if cost_info:
+        input_cost = (total_input / 1_000_000) * cost_info["input"]
+        output_cost = (total_output / 1_000_000) * cost_info["output"]
+        total_cost = input_cost + output_cost
+    
+    # Format the cost to a string with 5 decimal places to ensure precision in output files.
+    total_cost_usd_str = f"{total_cost:.5f}"
+    analysis_data["total_cost_usd"] = total_cost_usd_str
+
+    # 1. Save detailed JSON report in analysis/ directory
+    try:
+        ANALYSIS_DIR.mkdir(exist_ok=True)
+        json_report_path = ANALYSIS_DIR / f"{job_id}.json"
+        with open(json_report_path, 'w') as f:
+            json.dump(analysis_data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving JSON analysis report for job {job_id}: {e}")
+
+    # 2. Append summary to report.csv
+    try:
+        file_exists = REPORT_CSV_FILE.is_file()
+        with open(REPORT_CSV_FILE, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            header = ['job_id', 'total_input_tokens', 'total_output_tokens', 'total_cost_usd']
+            if not file_exists:
+                writer.writerow(header)
+            
+            row = [job_id, total_input, total_output, total_cost_usd_str]
+            writer.writerow(row)
+    except Exception as e:
+        print(f"Error updating CSV report: {e}")
+
 
 # --- API Models ---
 class SearchRequest(BaseModel):
@@ -67,7 +156,8 @@ class AgentState(TypedDict):
     step: int
     max_steps: int
     last_action: dict
-    history: List[str] # NEW: Agent's memory
+    history: List[str] 
+    token_usage: List[dict] # NEW: To store token usage per step
 
 # --- LangGraph Nodes ---
 def navigate_to_page(state: AgentState) -> AgentState:
@@ -84,16 +174,26 @@ def agent_reasoning_node(state: AgentState) -> AgentState:
     resize_image_if_needed(screenshot_path)
     state['screenshots'].append(f"screenshots/{job_id}/{state['step']:02d}_step.png")
 
-    action_response = get_agent_action(
+    # MODIFIED: Capture token usage from agent action
+    action_response, usage = get_agent_action(
         query=state['refined_query'],
         url=state['page'].url,
         html=state['page'].content(),
         provider=state['provider'],
         screenshot_path=screenshot_path,
-        history="\n".join(state['history']) # Pass the memory to the agent
+        history="\n".join(state['history'])
     )
     
-    push_status(job_id, "agent_thought", {"thought": action_response.get("thought", "No thought provided.")})
+    # NEW: Store usage for this step
+    state['token_usage'].append({
+        "task": f"agent_step_{state['step']}",
+        **usage
+    })
+
+    push_status(job_id, "agent_thought", {
+        "thought": action_response.get("thought", "No thought provided."),
+        "usage": usage
+    })
     state['last_action'] = action_response.get("action", {"type": "finish", "reason": "Agent failed to produce a valid action."})
     return state
 
@@ -123,17 +223,14 @@ def execute_action_node(state: AgentState) -> AgentState:
             push_status(job_id, "partial_result", {"new_items_found": len(items), "total_items": len(state['results'])})
         
         page.wait_for_timeout(2000)
-        # NEW: Record successful action in history
         state['history'].append(f"Step {state['step']}: Action `{json.dumps(action)}` executed successfully.")
 
     except Exception as e:
-        error_message = str(e).splitlines()[0] # Get a concise error message
+        error_message = str(e).splitlines()[0] 
         push_status(job_id, "action_failed", {"action": action, "error": error_message})
-        # NEW: Record failed action in history
         state['history'].append(f"Step {state['step']}: Action `{json.dumps(action)}` FAILED with error: '{error_message}'")
         
     state['step'] += 1
-    # NEW: Keep history concise (last 5 actions)
     state['history'] = state['history'][-5:]
     return state
 
@@ -163,23 +260,38 @@ graph_app = builder.compile()
 
 # --- The Core Job Orchestrator ---
 def run_job(job_id: str, payload: dict):
+    provider = payload["llm_provider"]
+    job_analysis = {
+        "job_id": job_id,
+        "timestamp": get_current_timestamp(),
+        "provider": provider,
+        "model": MODEL_MAPPING.get(provider, "unknown"),
+        "query": payload["query"],
+        "url": payload["url"],
+        "steps": []
+    }
+    
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
         page = browser.new_page()
         final_result = {}
+        final_state = {}
         try:
-            push_status(job_id, "job_started", {"provider": payload["llm_provider"], "query": payload["query"]})
+            push_status(job_id, "job_started", {"provider": provider, "query": payload["query"]})
             
-            refined_query = get_refined_prompt(payload["url"], payload["query"], payload["llm_provider"])
-            push_status(job_id, "prompt_refined", {"refined_query": refined_query})
+            # MODIFIED: Capture token usage from prompt refinement
+            refined_query, usage = get_refined_prompt(payload["url"], payload["query"], provider)
+            job_analysis["steps"].append({"task": "refine_prompt", **usage})
+            push_status(job_id, "prompt_refined", {"refined_query": refined_query, "usage": usage})
 
             initial_state = AgentState(
                 job_id=job_id, browser=browser, page=page, query=payload["url"],
-                top_k=payload["top_k"], provider=payload["llm_provider"],
+                top_k=payload["top_k"], provider=provider,
                 refined_query=refined_query, results=[], screenshots=[],
                 job_artifacts_dir=SCREENSHOTS_DIR / job_id,
                 step=1, max_steps=15, last_action={},
-                history=[] # Initialize empty memory
+                history=[],
+                token_usage=[] # Initialize empty token usage list
             )
             initial_state['job_artifacts_dir'].mkdir(exist_ok=True)
             
@@ -192,6 +304,12 @@ def run_job(job_id: str, payload: dict):
         finally:
             JOB_RESULTS[job_id] = final_result
             push_status(job_id, "job_done")
+            
+            # NEW: Aggregate and save analysis report
+            if final_state:
+                job_analysis["steps"].extend(final_state.get('token_usage', []))
+            save_analysis_report(job_analysis)
+            
             page.close()
             browser.close()
 
