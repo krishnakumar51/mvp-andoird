@@ -70,10 +70,20 @@ class AgentState(TypedDict):
     refined_query: str; results: List[dict]; screenshots: List[str]; job_artifacts_dir: Path
     step: int; max_steps: int; last_action: dict; history: List[str]; token_usage: List[dict]
 
+# --- MODIFIED: Enhanced Navigation with Error Handling ---
 def navigate_to_page(state: AgentState) -> AgentState:
-    state['driver'].get(state['query']); time.sleep(3)
-    # The agent is now responsible for handling any pop-ups that appear.
-    push_status(state['job_id'], "navigation_complete", {"url": state['driver'].current_url})
+    try:
+        expected_url = state['query']
+        state['driver'].get(expected_url)
+        time.sleep(5)  # Increased wait for page load
+        current_url = state['driver'].current_url
+        if not current_url or current_url != expected_url:
+            raise WebDriverException(f"Navigation failed: expected '{expected_url}', but got '{current_url}' (possible network/Chrome issue)")
+        push_status(state['job_id'], "navigation_complete", {"url": current_url})
+    except Exception as e:
+        error_msg = str(e)
+        push_status(state['job_id'], "navigation_failed", {"error": error_msg, "expected_url": state['query']})
+        raise  # Re-raise to halt the job and log in run_job
     return state
 
 def agent_reasoning_node(state: AgentState) -> AgentState:
@@ -205,4 +215,3 @@ async def get_screenshot(job_id: str, filename: str):
     return FileResponse(path)
 @app.get("/")
 async def client_ui(): return FileResponse(Path(__file__).parent / "static/test_client.html")
-
