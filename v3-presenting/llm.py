@@ -16,7 +16,7 @@ class LLMProvider(str, Enum):
 class MasterPlanTool(BaseModel):
     """Tool to define a high-level, multi-step plan to achieve the user's objective."""
     reasoning: str = Field(..., description="A step-by-step thought process explaining the generated plan.")
-    plan: List[str] = Field(..., description="A list of sequential, high-level goals. Valid goals are: 'INITIATE_SEARCH', 'EXECUTE_SEARCH', 'APPLY_FILTER', 'APPLY_SORT', 'NAVIGATE', 'EXTRACT_DATA', 'ANALYZE_RESULTS'.")
+    plan: List[str] = Field(..., description="A list of sequential, high-level goals. Valid goals are: 'INITIATE_SEARCH', 'EXECUTE_SEARCH', 'APPLY_FILTER', 'APPLY_SORT', 'NAVIGATE', 'EXTRACT_DATA', 'ANALYZE_RESULTS'. Refinement goals like APPLY_FILTER or APPLY_SORT can be marked as optional, e.g., 'APPLY_SORT (Optional)'.")
 
 class TargetingTool(BaseModel):
     """Tool to determine the specific element to find on the page for a given sub-goal."""
@@ -34,7 +34,6 @@ class FillAndSubmitTool(BaseModel):
     text: str = Field(..., description="The text to be entered into the input field.")
     reason: str = Field(..., description="A brief explanation for this search action.")
 
-# --- UPDATED ScrollTool ---
 class ScrollTool(BaseModel):
     """Tool to scroll the page or a specific scrollable element."""
     direction: str = Field("down", description="The direction to scroll. Only 'down' is currently supported.")
@@ -50,9 +49,15 @@ class FinishTool(BaseModel):
     """Tool to finish the task successfully."""
     reason: str = Field(..., description="A summary of how the objective was completed.")
 
-ACTION_TOOLS = [TapTool, FillAndSubmitTool, ScrollTool, ExtractTool, FinishTool]
+# --- NEW TOOL ---
+class SkipStepTool(BaseModel):
+    """Tool to skip the current optional step in the plan."""
+    reason: str = Field(..., description="A brief explanation for why the optional step is being skipped (e.g., 'No visible sort button found').")
 
-# --- PROMPT TEMPLATES (No changes to prompts themselves) ---
+
+ACTION_TOOLS = [TapTool, FillAndSubmitTool, ScrollTool, ExtractTool, FinishTool, SkipStepTool]
+
+# --- PROMPT TEMPLATES ---
 
 REFINER_PROMPT = """
 Analyze the user's request and create a concise, actionable instruction for an AI web agent. Focus on the ultimate goal.
@@ -61,22 +66,28 @@ User's Query: "{query}"
 Refined Instruction:
 """
 
+# --- UPGRADED PLANNER PROMPT ---
 PLANNER_PROMPT = """
-You are the "Planner" module for an autonomous web agent. Your first and most important task is to decompose the user's complex objective into a simple, high-level, sequential plan.
+You are the "Planner" module. Your job is to decompose the user's objective into a high-level, sequential plan.
 
 **User's Objective:** "{query}"
 
-**CRITICAL RULE:** If the user's objective on a known e-commerce or search-oriented site (like amazon, flipkart, iherb) involves words like 'find', 'search', 'list', or 'get', the first step in your plan MUST be 'INITIATE_SEARCH'. Do not add a 'NAVIGATE' step if the agent is already on the correct homepage.
+**CRITICAL RULES:**
+1.  If the user's objective on an e-commerce/search site involves 'find', 'search', or 'list', the first step MUST be 'INITIATE_SEARCH'. Do not add a 'NAVIGATE' step if the agent is already on the correct homepage.
+2.  Refinement goals like 'APPLY_FILTER' and 'APPLY_SORT' are often not essential. If the user's request is general (e.g., "find best products"), you can mark these steps as optional by adding ` (Optional)` to the goal name.
 
 **Your Task:**
-1.  Analyze the user's objective and obey the critical rule.
-2.  Think step-by-step about the logical sequence of actions a human would take.
-3.  Create a plan using only the following valid goal types: 'INITIATE_SEARCH', 'EXECUTE_SEARCH', 'APPLY_FILTER', 'APPLY_SORT', 'NAVIGATE', 'EXTRACT_DATA', 'ANALYZE_RESULTS'.
-4.  Call the `MasterPlanTool` with your reasoning and the final plan.
+- Analyze the user's objective and obey the critical rules.
+- Create a plan using only the valid goals: 'INITIATE_SEARCH', 'EXECUTE_SEARCH', 'APPLY_FILTER', 'APPLY_SORT', 'NAVIGATE', 'EXTRACT_DATA', 'ANALYZE_RESULTS'.
+- Call the `MasterPlanTool` with your reasoning and the final plan.
+
+**Example of an optional step:**
+- For "Find top-rated face masks", a good plan is: `["INITIATE_SEARCH", "EXECUTE_SEARCH", "APPLY_SORT (Optional)", "ANALYZE_RESULTS"]`
 """
 
+# --- UPGRADED TARGETING PROMPT ---
 TARGETING_PROMPT = """
-You are the "Targeting" module. Your job is to determine what specific text to look for on the page to accomplish the current sub-goal from the master plan.
+You are the "Targeting" module. Your job is to determine what to look for on the page to accomplish the current sub-goal.
 
 **User's Objective:** "{query}"
 **Master Plan:** {plan}
@@ -85,33 +96,35 @@ You are the "Targeting" module. Your job is to determine what specific text to l
 {history}
 
 **Triage Protocol:**
-1.  **Analyze Screenshot and HTML for Overlays:** Look carefully for evidence of pop-ups, cookie banners, or ads (e.g., elements with high z-index, or `role='dialog'`). Be conservative; don't assume a pop-up exists if the content looks normal.
-2.  **If an overlay exists:** Your ONLY goal is to close it. Call the `TargetingTool` with keywords for closing it (e.g., "Close", "Accept", "Continue", "X").
-3.  **If no overlay exists:** Based on the **Current Sub-Goal**, determine the best case-sensitive keywords to find the required element.
+1.  **CONTEXT-AWARE ESCAPE HATCH:** Check the `Recent Action History`. If your last action was tapping a 'Filter' or 'Sort' button and the screenshot now shows a menu/overlay, your ONLY goal is to "Close Overlay". Generate keywords to find an 'Apply', 'Done', 'Close', or 'X' button.
+2.  **Analyze for other Overlays:** If the first rule doesn't apply, check for any other unexpected pop-ups or cookie banners. If one exists, your goal is to close it.
+3.  **Default Goal:** If no overlays exist, determine the best case-sensitive keywords to achieve the **Current Sub-Goal**.
 
 Call the `TargetingTool` with your decision.
 """
 
+# --- UPGRADED AGENT PROMPT ---
 AGENT_PROMPT = """
-You are the "Action" module. You have been given a specific sub-goal and a list of candidate elements. Your job is to choose the single best element and the correct tool to interact with it.
+You are the "Action" module. You are given a sub-goal and a list of candidate elements. Your job is to choose the best action.
 
 **User's Objective:** "{query}"
 **Current Sub-Goal:** "{sub_goal}"
-**Master Plan:** {plan}
 **Recent Action History:**
 {history}
 **Candidate Elements Found on Page:**
 {candidate_elements}
 
 **Your Task & Rules:**
-1.  **CHECK HISTORY FIRST:** Read the last message in `Recent Action History`. If it starts with "✅ SUCCESS" and says a goal is complete, your task is to achieve the *next* goal in the Master Plan. DO NOT repeat the goal that was just finished.
-2.  **Analyze the Candidates:** Review the list of elements to find the best fit for the `Current Sub-Goal`.
-3.  **Choose and Act:** Select the ONE best candidate and call the appropriate tool (`TapTool`, `FillAndSubmitTool`, etc.), using the exact selector provided.
-4.  **FALLBACK RULE:** If the 'Candidate Elements' list is empty or unsuitable, your only permitted actions are `ScrollTool` (to find more elements) or `FinishTool` (if the task is impossible). Do not invent actions.
+1.  **CHECK HISTORY:** Read the last message in `Recent Action History`. If it says a goal is complete, focus on the *next* goal. Do not repeat the completed goal.
+2.  **Analyze Candidates:** Review the list to find the best fit for the `Current Sub-Goal`.
+3.  **Choose and Act:** Select the best candidate and call the appropriate tool (`TapTool`, `FillAndSubmitTool`, etc.), using the exact selector provided.
+4.  **FALLBACK RULE:** If the 'Candidate Elements' list is empty or unsuitable:
+    a. Check if your `Current Sub-Goal` contains `(Optional)`. If it does, you MUST call the `SkipStepTool`.
+    b. If the goal is not optional, your only permitted actions are `ScrollTool` or `FinishTool`. Do not invent actions.
 """
 
 def get_llm_response(system_prompt: str, prompt: str, provider: LLMProvider, tools: List[BaseModel], images: List[Path] = []) -> Tuple[Optional[str], Optional[dict], dict]:
-    # This function remains the same
+    # This function is now stable
     usage = {"input_tokens": 0, "output_tokens": 0}
     try:
         if provider == LLMProvider.ANTHROPIC:
@@ -119,28 +132,19 @@ def get_llm_response(system_prompt: str, prompt: str, provider: LLMProvider, too
             tool_definitions = []
             for tool in tools:
                 schema = tool.model_json_schema()
-                anthropic_tool_definition = {
-                    "name": schema['title'], "description": schema.get('description', f"A tool for {schema['title']}"),
-                    "input_schema": schema
-                }
+                anthropic_tool_definition = {"name": schema['title'], "description": schema.get('description', f"A tool for {schema['title']}"), "input_schema": schema}
                 tool_definitions.append(anthropic_tool_definition)
             messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
             if images and images[0].is_file():
-                with open(images[0], "rb") as f:
-                    img_data = base64.b64encode(f.read()).decode("utf-8")
+                with open(images[0], "rb") as f: img_data = base64.b64encode(f.read()).decode("utf-8")
                 messages[0]["content"].append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_data}})
-            response = anthropic_client.messages.create(
-                model=ANTHROPIC_MODEL, max_tokens=2048, system=system_prompt, messages=messages,
-                tools=tool_definitions, tool_choice={"type": "auto"}
-            )
+            response = anthropic_client.messages.create(model=ANTHROPIC_MODEL, max_tokens=2048, system=system_prompt, messages=messages, tools=tool_definitions, tool_choice={"type": "auto"})
             usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
             for content_block in response.content:
                 if content_block.type == "tool_use":
-                    tool_name_from_api = content_block.name
-                    tool_input = content_block.input
+                    tool_name_from_api, tool_input = content_block.name, content_block.input
                     original_tool = next((t for t in tools if t.model_json_schema()['title'] == tool_name_from_api), None)
-                    if original_tool:
-                        return original_tool.__name__, tool_input, usage
+                    if original_tool: return original_tool.__name__, tool_input, usage
             return None, None, usage
     except Exception as e:
         print(f"LLM API call failed for {provider}: {e}")
@@ -148,28 +152,23 @@ def get_llm_response(system_prompt: str, prompt: str, provider: LLMProvider, too
     return None, None, usage
 
 def create_master_plan(query: str, provider: LLMProvider) -> Tuple[dict, dict]:
-    # This function remains the same
     prompt = PLANNER_PROMPT.format(query=query)
     system_prompt = "You are the Planner module. Decompose the user's objective and call the MasterPlanTool."
     tool_name, tool_input, usage = get_llm_response(system_prompt, prompt, provider, tools=[MasterPlanTool])
-    if tool_name == MasterPlanTool.__name__:
-        return tool_input, usage
+    if tool_name == MasterPlanTool.__name__: return tool_input, usage
     return {"reasoning": "Failed to create a plan.", "plan": ["INITIATE_SEARCH", "EXECUTE_SEARCH", "ANALYZE_RESULTS"]}, usage
 
 def get_targeting_decision(query: str, plan: List[str], plan_step: int, history: str, provider: LLMProvider, screenshot_path: Path) -> Tuple[dict, dict]:
-    # This function remains the same
     sub_goal = plan[plan_step] if plan_step < len(plan) else "ANALYZE_RESULTS"
-    prompt = TARGETING_PROMPT.format(query=query, plan=plan, sub_goal=sub_goal, history=history)
+    prompt = TARGETING_PROMPT.format(query=query, plan=plan, sub_goal=sub_goal.replace(" (Optional)", ""), history=history)
     system_prompt = "You are the Targeting module. Identify the immediate goal and keywords, then call the TargetingTool."
     tool_name, tool_input, usage = get_llm_response(system_prompt, prompt, provider, tools=[TargetingTool], images=[screenshot_path])
-    if tool_name == TargetingTool.__name__:
-        return tool_input, usage
+    if tool_name == TargetingTool.__name__: return tool_input, usage
     return {"goal_description": "Error in targeting", "keywords": []}, usage
 
 def get_agent_action(query: str, plan: List[str], plan_step: int, candidate_elements: str, history: str, provider: LLMProvider, screenshot_path: Path) -> Tuple[dict, dict]:
-    # This function remains the same
     sub_goal = plan[plan_step] if plan_step < len(plan) else "ANALYZE_RESULTS"
-    prompt = AGENT_PROMPT.format(query=query, sub_goal=sub_goal, plan=plan, candidate_elements=candidate_elements, history=history)
+    prompt = AGENT_PROMPT.format(query=query, sub_goal=sub_goal, candidate_elements=candidate_elements, history=history)
     system_prompt = "You are the Action module. Choose the best candidate element and call the appropriate tool."
     tool_name, tool_input, usage = get_llm_response(system_prompt, prompt, provider, tools=ACTION_TOOLS, images=[screenshot_path])
     if tool_name and tool_input:
@@ -178,16 +177,11 @@ def get_agent_action(query: str, plan: List[str], plan_step: int, candidate_elem
     return {"type": "finish", "reason": "Agent could not decide on a valid action."}, usage
 
 def get_refined_prompt(url: str, query: str, provider: LLMProvider) -> Tuple[str, dict]:
-    # This function remains the same
     prompt = REFINER_PROMPT.format(url=url, query=query)
     try:
         if provider == LLMProvider.ANTHROPIC:
-            response = anthropic_client.messages.create(
-                model=ANTHROPIC_MODEL, max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            response = anthropic_client.messages.create(model=ANTHROPIC_MODEL, max_tokens=1024, messages=[{"role": "user", "content": prompt}])
             usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
             return response.content[0].text.strip(), usage
-    except Exception as e:
-        print(f"Refiner prompt failed: {e}")
+    except Exception as e: print(f"Refiner prompt failed: {e}")
     return query, {}

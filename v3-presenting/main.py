@@ -36,19 +36,17 @@ APPIUM_SERVER_URL = "http://localhost:4723"
 
 def get_current_timestamp(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 def push_status(job_id: str, msg: str, details: dict = None):
-    # This function remains the same
     q = JOB_QUEUES.get(job_id)
     if q: q.put_nowait({"ts": get_current_timestamp(), "msg": msg, **({"details": details} if details else {})})
 
 def resize_image_if_needed(path: Path):
-    # This function remains the same
     try:
         with Image.open(path) as img:
             if max(img.size) > 2000: img.thumbnail((2000, 2000), Image.LANCZOS); img.save(path)
     except Exception as e: print(f"Warning: Could not resize {path}. Error: {e}")
 
 def save_analysis_report(data: dict):
-    # This function remains the same
+    # This function remains stable
     job_id, provider, model = data["job_id"], data["provider"], data["model"]
     total_input = sum(s.get("input_tokens", 0) for s in data["token_usage"])
     total_output = sum(s.get("output_tokens", 0) for s in data["token_usage"])
@@ -68,11 +66,9 @@ def save_analysis_report(data: dict):
     except Exception as e: print(f"Error saving analysis: {e}")
 
 class SearchRequest(BaseModel):
-    # This class remains the same
     url: str; query: str; top_k: int; llm_provider: LLMProvider = LLMProvider.ANTHROPIC
 
 class AgentState(TypedDict):
-    # This class remains the same
     job_id: str; driver: webdriver.Remote; query: str; top_k: int; provider: LLMProvider
     refined_query: str; results: List[dict]; screenshots: List[str]; job_artifacts_dir: Path
     step: int; max_steps: int; last_action: dict; history: List[str]; token_usage: List[dict]
@@ -80,7 +76,7 @@ class AgentState(TypedDict):
     plan_step: int
 
 def get_element_xpath(driver: webdriver.Remote, element: WebElement) -> str:
-    # This function remains the same
+    # This function is now stable
     return driver.execute_script(
         "function getXPath(element) {"
         "if (element.id !== '') return `//*[@id=\"${element.id}\"]`;"
@@ -96,26 +92,21 @@ def get_element_xpath(driver: webdriver.Remote, element: WebElement) -> str:
         "return getXPath(arguments[0]);", element)
 
 def find_candidate_elements(driver: webdriver.Remote, keywords: List[str]) -> List[dict]:
-    # This function remains the same
+    # This function is now stable
     if not keywords: return []
     queries = []
     for k in keywords:
         k_escaped = k.replace("'", "\"'\"")
-        queries.extend([
-            f"contains(normalize-space(.), '{k_escaped}')", f"contains(@placeholder, '{k_escaped}')",
-            f"contains(@aria-label, '{k_escaped}')", f"contains(@title, '{k_escaped}')"
-        ])
+        queries.extend([f"contains(normalize-space(.), '{k_escaped}')", f"contains(@placeholder, '{k_escaped}')", f"contains(@aria-label, '{k_escaped}')", f"contains(@title, '{k_escaped}')"])
     full_query = " or ".join(queries)
     xpath = f"//*[{full_query}]"
-    
     candidates = []
     try:
         elements = driver.find_elements(By.XPATH, xpath)
         interactive_elements = []
         for element in elements:
             try:
-                if not element.is_displayed() or not element.is_enabled():
-                    continue
+                if not element.is_displayed() or not element.is_enabled(): continue
                 tag = element.tag_name.lower()
                 text = (element.text or element.get_attribute("value") or element.get_attribute("aria-label") or "")
                 score = 0
@@ -126,23 +117,19 @@ def find_candidate_elements(driver: webdriver.Remote, keywords: List[str]) -> Li
             except StaleElementReferenceException:
                 print(f"Warning: Stale element reference encountered. Skipping element.")
                 continue
-            except Exception as e:
-                print(f"Warning: Could not process an element. {e}")
+            except Exception as e: print(f"Warning: Could not process an element. {e}")
         candidates = sorted(interactive_elements, key=lambda x: x['score'], reverse=True)
-    except Exception as e:
-        print(f"Error finding candidate elements: {e}")
+    except Exception as e: print(f"Error finding candidate elements: {e}")
     return candidates[:15]
 
 # --- GRAPH NODES ---
 
 def navigate_to_page(state: AgentState) -> AgentState:
-    # This function remains the same
     state['driver'].get(state['query']); time.sleep(5)
     push_status(state['job_id'], "navigation_complete", {"url": state['driver'].current_url})
     return state
 
 def planner_node(state: AgentState) -> AgentState:
-    # This function remains the same
     push_status(state['job_id'], "agent_planning")
     plan, usage = create_master_plan(state['refined_query'], state['provider'])
     state['master_plan'] = plan.get('plan', [])
@@ -152,28 +139,24 @@ def planner_node(state: AgentState) -> AgentState:
     return state
 
 def agent_reasoning_node(state: AgentState) -> AgentState:
-    # This function remains the same
     job_id, driver = state['job_id'], state['driver']
     current_sub_goal = state['master_plan'][state['plan_step']] if state['plan_step'] < len(state['master_plan']) else "ANALYZE_RESULTS"
     push_status(job_id, "agent_step", {"step": state['step'], "max_steps": state['max_steps'], "current_goal": current_sub_goal})
     screenshot_path = state['job_artifacts_dir'] / f"{state['step']:02d}_step.png"
     driver.get_screenshot_as_file(str(screenshot_path)); resize_image_if_needed(screenshot_path)
     state['screenshots'].append(f"screenshots/{job_id}/{state['step']:02d}_step.png")
-    targeting, usage1 = get_targeting_decision(
-        query=state['refined_query'], plan=state['master_plan'], plan_step=state['plan_step'],
-        history="\n".join(state['history']), provider=state['provider'], screenshot_path=screenshot_path
-    )
+
+    targeting, usage1 = get_targeting_decision(query=state['refined_query'], plan=state['master_plan'], plan_step=state['plan_step'], history="\n".join(state['history']), provider=state['provider'], screenshot_path=screenshot_path)
     state['token_usage'].append({"task": f"targeting_step_{state['step']}", **usage1})
     push_status(job_id, "agent_targeting", {"decision": targeting, "usage": usage1})
+
     candidates = find_candidate_elements(driver, targeting.get("keywords", []))
     candidates_str = "No suitable elements found matching keywords." if not candidates else json.dumps(candidates, indent=2)
-    action, usage2 = get_agent_action(
-        query=state['refined_query'], plan=state['master_plan'], plan_step=state['plan_step'],
-        candidate_elements=candidates_str, history="\n".join(state['history']),
-        provider=state['provider'], screenshot_path=screenshot_path
-    )
+
+    action, usage2 = get_agent_action(query=state['refined_query'], plan=state['master_plan'], plan_step=state['plan_step'], candidate_elements=candidates_str, history="\n".join(state['history']), provider=state['provider'], screenshot_path=screenshot_path)
     state['token_usage'].append({"task": f"action_step_{state['step']}", **usage2})
     push_status(job_id, "agent_action_thought", {"thought": action.get("reason"), "usage": usage2})
+
     state['last_action'] = action
     return state
 
@@ -188,6 +171,8 @@ def execute_action_node(state: AgentState) -> AgentState:
         
         current_goal = state['master_plan'][state['plan_step']] if state['plan_step'] < len(state['master_plan']) else "ANALYZE_RESULTS"
         
+        if selector: wait.until(EC.presence_of_element_located((By.XPATH, selector)))
+        
         if action_type == "tap":
             element = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
             element.click()
@@ -196,30 +181,28 @@ def execute_action_node(state: AgentState) -> AgentState:
             element.click(); element.clear()
             element.send_keys(action["text"])
             element.send_keys(Keys.ENTER)
-        
-        # --- FIX STARTS HERE: Smart Scrolling Logic ---
         elif action_type == "scroll":
-            if selector: # If a specific element selector is provided for scrolling
+            if selector:
                 try:
                     scroll_element = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
                     driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].offsetHeight * 0.8;", scroll_element)
                 except Exception as e:
                     print(f"Could not scroll specific element '{selector}', defaulting to window scroll. Error: {e}")
-                    # Fallback to window scroll if specific element scroll fails
                     driver.execute_script("window.scrollBy(0, window.innerHeight * 0.8);")
-            else: # Default to scrolling the main window
+            else:
                 driver.execute_script("window.scrollBy(0, window.innerHeight * 0.8);")
-        # --- FIX ENDS HERE ---
-                
         elif action_type == "extract":
             state['results'].extend(action.get("items", []))
             push_status(job_id, "partial_result", {"new_items_found": len(action.get("items", []))})
+        elif action_type == "skip_step":
+             pass # This is a logical action, no browser interaction needed.
 
-        time.sleep(4)
+        time.sleep(4 if action_type != 'skip_step' else 0.1)
         
-        success_message = f"✅ SUCCESS (Step {state['step']}): The '{current_goal}' goal is complete."
-        if action_type == "fill_and_submit":
-            success_message += f" The page should now show results for '{action.get('text')}'."
+        if action_type == 'skip_step':
+            success_message = f"✅ SKIPPED (Step {state['step']}): The optional '{current_goal}' goal was skipped."
+        else:
+            success_message = f"✅ SUCCESS (Step {state['step']}): The '{current_goal}' goal is complete."
         state['history'].append(success_message)
         
         if action_type not in ["extract", "finish", "scroll"]:
@@ -228,20 +211,19 @@ def execute_action_node(state: AgentState) -> AgentState:
     except Exception as e:
         error_message = str(e).splitlines()[0] if str(e).strip() else f"An unspecified error occurred: {type(e).__name__}"
         push_status(job_id, "action_failed", {"action": action, "error": error_message})
-        state['history'].append(f"Step {state['step']}: Action `{action_type}` FAILED: {error_message}")
+        state['history'].append(f"Step {state['step']}: Action `{action.get('type')}` FAILED: {error_message}")
 
     state['step'] += 1
     state['history'] = state['history'][-5:]
     return state
 
 def supervisor_node(state: AgentState) -> str:
-    # This function remains the same
     is_plan_done = state['plan_step'] >= len(state['master_plan'])
     if state['last_action'].get("type") == "finish" or len(state['results']) >= state['top_k'] or state['step'] > state['max_steps'] or is_plan_done:
         return "end"
     return "continue"
 
-# Graph Definition and the rest of the file remains the same...
+# --- GRAPH DEFINITION ---
 builder = StateGraph(AgentState)
 builder.add_node("navigate", navigate_to_page)
 builder.add_node("planner", planner_node)
@@ -255,7 +237,7 @@ builder.add_conditional_edges("execute", supervisor_node, {"end": END, "continue
 graph_app = builder.compile()
 
 def run_job(job_id: str, payload: dict):
-    # This function remains the same
+    # This function remains stable
     provider = payload["llm_provider"]
     job_analysis = { "job_id": job_id, "timestamp": get_current_timestamp(), "provider": provider, "model": MODEL_MAPPING.get(provider, "unknown"), "query": payload["query"], "url": payload["url"], "token_usage": [] }
     driver, final_state = None, {}
@@ -296,15 +278,14 @@ def run_job(job_id: str, payload: dict):
         save_analysis_report(job_analysis)
         if driver: driver.quit()
 
+# --- FastAPI Endpoints ---
 @app.post("/search")
 async def start_search(req: SearchRequest):
-    # This function remains the same
     job_id = str(uuid.uuid4()); JOB_QUEUES[job_id] = asyncio.Queue()
     asyncio.get_event_loop().run_in_executor(None, run_job, job_id, req.dict())
     return {"job_id": job_id, "stream_url": f"/stream/{job_id}", "result_url": f"/result/{job_id}"}
 @app.get("/stream/{job_id}")
 async def stream_status(job_id: str):
-    # This function remains the same
     q = JOB_QUEUES.get(job_id)
     if not q: raise HTTPException(status_code=404, detail="Job not found")
     async def event_generator():
@@ -317,15 +298,12 @@ async def stream_status(job_id: str):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 @app.get("/result/{job_id}")
 async def get_result(job_id: str):
-    # This function remains the same
-    return JSONResponse(JOB_QUEUES.get(job_id, {"status": "pending"}), status_code=200 if job_id in JOB_RESULTS else 202)
+    return JSONResponse(JOB_RESULTS.get(job_id, {"status": "pending"}), status_code=200 if job_id in JOB_RESULTS else 202)
 @app.get("/screenshots/{job_id}/{filename}")
 async def get_screenshot(job_id: str, filename: str):
-    # This function remains the same
     path = SCREENSHOTS_DIR / job_id / filename
     if not path.is_file(): raise HTTPException(status_code=404, detail="Screenshot not found")
     return FileResponse(path)
 @app.get("/")
 async def client_ui():
-    # This function remains the same
     return FileResponse(Path(__file__).parent / "static/test_client.html")

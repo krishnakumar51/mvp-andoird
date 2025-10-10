@@ -17,7 +17,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Make sure the selected models support the required capabilities (e.g., vision).
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o") # Vision-capable
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-70b-8192") # No Vision
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514") # Vision-capable
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5") # Vision-capable
 
 # --- Global Directories ---
 # Ensures a consistent directory structure for generated artifacts.

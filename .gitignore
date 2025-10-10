@@ -1,6 +1,9 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+flip/
 analysis/
+amazon/
+iherb/
 report.csv
 screenshots/
 *.py[codz]

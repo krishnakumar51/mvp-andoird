@@ -34,11 +34,9 @@ class FillAndSubmitTool(BaseModel):
     text: str = Field(..., description="The text to be entered into the input field.")
     reason: str = Field(..., description="A brief explanation for this search action.")
 
-# --- UPDATED ScrollTool ---
 class ScrollTool(BaseModel):
-    """Tool to scroll the page or a specific scrollable element."""
+    """Tool to scroll the page."""
     direction: str = Field("down", description="The direction to scroll. Only 'down' is currently supported.")
-    selector: Optional[str] = Field(None, description="Optional. The XPath selector of a specific scrollable element (like a modal or panel) to scroll inside of.")
     reason: str = Field(..., description="A brief explanation of why scrolling is necessary.")
 
 class ExtractTool(BaseModel):
@@ -52,7 +50,7 @@ class FinishTool(BaseModel):
 
 ACTION_TOOLS = [TapTool, FillAndSubmitTool, ScrollTool, ExtractTool, FinishTool]
 
-# --- PROMPT TEMPLATES (No changes to prompts themselves) ---
+# --- PROMPT TEMPLATES ---
 
 REFINER_PROMPT = """
 Analyze the user's request and create a concise, actionable instruction for an AI web agent. Focus on the ultimate goal.
@@ -61,6 +59,7 @@ User's Query: "{query}"
 Refined Instruction:
 """
 
+# --- UPGRADED PLANNER PROMPT ---
 PLANNER_PROMPT = """
 You are the "Planner" module for an autonomous web agent. Your first and most important task is to decompose the user's complex objective into a simple, high-level, sequential plan.
 
@@ -85,15 +84,16 @@ You are the "Targeting" module. Your job is to determine what specific text to l
 {history}
 
 **Triage Protocol:**
-1.  **Analyze Screenshot and HTML for Overlays:** Look carefully for evidence of pop-ups, cookie banners, or ads (e.g., elements with high z-index, or `role='dialog'`). Be conservative; don't assume a pop-up exists if the content looks normal.
-2.  **If an overlay exists:** Your ONLY goal is to close it. Call the `TargetingTool` with keywords for closing it (e.g., "Close", "Accept", "Continue", "X").
+1.  **Analyze Screenshot and HTML for Overlays:** Look for evidence of pop-ups or cookie banners. Be conservative; don't assume one exists if the content looks normal.
+2.  **If an overlay exists:** Your ONLY goal is to close it. Call the `TargetingTool` with keywords for closing it (e.g., "Close", "Accept", "X").
 3.  **If no overlay exists:** Based on the **Current Sub-Goal**, determine the best case-sensitive keywords to find the required element.
 
 Call the `TargetingTool` with your decision.
 """
 
+# --- UPGRADED AGENT PROMPT ---
 AGENT_PROMPT = """
-You are the "Action" module. You have been given a specific sub-goal and a list of candidate elements. Your job is to choose the single best element and the correct tool to interact with it.
+You are the "Action" module for an autonomous web agent. You have been given a specific sub-goal and a list of candidate elements. Your job is to choose the single best element and the correct tool to interact with it.
 
 **User's Objective:** "{query}"
 **Current Sub-Goal:** "{sub_goal}"
@@ -111,7 +111,7 @@ You are the "Action" module. You have been given a specific sub-goal and a list 
 """
 
 def get_llm_response(system_prompt: str, prompt: str, provider: LLMProvider, tools: List[BaseModel], images: List[Path] = []) -> Tuple[Optional[str], Optional[dict], dict]:
-    # This function remains the same
+    # This function is now stable
     usage = {"input_tokens": 0, "output_tokens": 0}
     try:
         if provider == LLMProvider.ANTHROPIC:
@@ -148,7 +148,6 @@ def get_llm_response(system_prompt: str, prompt: str, provider: LLMProvider, too
     return None, None, usage
 
 def create_master_plan(query: str, provider: LLMProvider) -> Tuple[dict, dict]:
-    # This function remains the same
     prompt = PLANNER_PROMPT.format(query=query)
     system_prompt = "You are the Planner module. Decompose the user's objective and call the MasterPlanTool."
     tool_name, tool_input, usage = get_llm_response(system_prompt, prompt, provider, tools=[MasterPlanTool])
@@ -157,7 +156,6 @@ def create_master_plan(query: str, provider: LLMProvider) -> Tuple[dict, dict]:
     return {"reasoning": "Failed to create a plan.", "plan": ["INITIATE_SEARCH", "EXECUTE_SEARCH", "ANALYZE_RESULTS"]}, usage
 
 def get_targeting_decision(query: str, plan: List[str], plan_step: int, history: str, provider: LLMProvider, screenshot_path: Path) -> Tuple[dict, dict]:
-    # This function remains the same
     sub_goal = plan[plan_step] if plan_step < len(plan) else "ANALYZE_RESULTS"
     prompt = TARGETING_PROMPT.format(query=query, plan=plan, sub_goal=sub_goal, history=history)
     system_prompt = "You are the Targeting module. Identify the immediate goal and keywords, then call the TargetingTool."
@@ -167,7 +165,6 @@ def get_targeting_decision(query: str, plan: List[str], plan_step: int, history:
     return {"goal_description": "Error in targeting", "keywords": []}, usage
 
 def get_agent_action(query: str, plan: List[str], plan_step: int, candidate_elements: str, history: str, provider: LLMProvider, screenshot_path: Path) -> Tuple[dict, dict]:
-    # This function remains the same
     sub_goal = plan[plan_step] if plan_step < len(plan) else "ANALYZE_RESULTS"
     prompt = AGENT_PROMPT.format(query=query, sub_goal=sub_goal, plan=plan, candidate_elements=candidate_elements, history=history)
     system_prompt = "You are the Action module. Choose the best candidate element and call the appropriate tool."
@@ -178,7 +175,6 @@ def get_agent_action(query: str, plan: List[str], plan_step: int, candidate_elem
     return {"type": "finish", "reason": "Agent could not decide on a valid action."}, usage
 
 def get_refined_prompt(url: str, query: str, provider: LLMProvider) -> Tuple[str, dict]:
-    # This function remains the same
     prompt = REFINER_PROMPT.format(url=url, query=query)
     try:
         if provider == LLMProvider.ANTHROPIC:
